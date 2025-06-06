@@ -15,6 +15,7 @@ class MonologueManager:
     def __init__(self,
                 client: OpenRouterClient,
                 model: str = "openai/gpt-4o",
+                use_patch: bool = False,
                 ):
         """
         Initialize the manager for the inner monologue implementation.
@@ -29,7 +30,7 @@ class MonologueManager:
         self.model = model
         
         # Initialize the monologue processor
-        self.monologue_processor = InnerMonologue(client, model)
+        self.monologue_processor = InnerMonologue(client, model, use_patch=use_patch)
         print(f"INFO: Initialized inner monologue processor")
         
         # --- Salience Gate Initialization ---

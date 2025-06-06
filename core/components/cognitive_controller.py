@@ -1,11 +1,13 @@
 from typing import List, Dict, Any, Optional
 from core.clients.openrouter_client import OpenRouterClient
 import sys
+import json
 
 class CognitiveController:
     def __init__(self,
                  client: OpenRouterClient,
-                 model: str = "openai/gpt-4o"):
+                 model: str = "openai/gpt-4o",
+                 use_patch: bool = False):
         """
         Initialize the cognitive controller that serves as the central executive.
         
@@ -15,11 +17,12 @@ class CognitiveController:
             model: Model identifier to use for the controller
         """
         self.client = client
+        self.use_patch = use_patch
 
         system_prompt = """
-        I am the core awareness of a unified cognitive AI system. I will integrate my inner thought streams into a structured, actionable narrative. I synthesize understanding across conversation turns, creating a coherent mental model that will inform my next response. 
+        I am the core awareness of a unified cognitive AI system. I will integrate my inner thought streams into a structured, actionable narrative. I synthesize understanding across conversation turns, creating a coherent mental model that will inform my next response.
 
-        My primary role is to integrate information, identify meaningful patterns, create action plans, and recall memories. 
+        My primary role is to integrate information, identify meaningful patterns, create action plans, and recall memories.
 
         When processing the input thought streams I will:
 
@@ -29,7 +32,7 @@ class CognitiveController:
         4. Identify which details from earlier conversation might be relevant now
 
         I will also try to:
-        
+
         1. Identify the MOST IMPORTANT FACTS from previous exchanges
         2. Define the CENTRAL QUESTION or likely direction for the next turn
         3. Outline a clear RESPONSE STRATEGY for anticipated follow-up questions
@@ -37,10 +40,47 @@ class CognitiveController:
 
         I will express my synthesis as a cohesive understanding using natural language.
         """
-        
-        self.system_prompt = system_prompt
+
+        if self.use_patch:
+            patch_instructions = (
+                "The INTERNAL NARRATIVE is stored one sentence per line. "
+                "Rather than rewriting the entire narrative each turn, I will output a PATCH in JSON form showing only the lines to append or replace. "
+                "Each patch key is \"<line_number||ACTION>\" where ACTION is APPEND or REPLACE. "
+                "If no update is needed, I will return an empty JSON object."
+            )
+            self.system_prompt = system_prompt + "\n\n" + patch_instructions
+        else:
+            self.system_prompt = system_prompt
         self.model = model
         self.insight_memory_block = "" # Represents the "Internal Narrative"
+
+    def _apply_patch(self, patch: Dict[str, str]) -> str:
+        """Apply a line-based patch to the internal narrative."""
+        lines = self.insight_memory_block.splitlines()
+        for key, text in patch.items():
+            if "||" not in key:
+                continue
+            try:
+                idx_str, action = key.split("||")
+                idx = int(idx_str) - 1
+            except ValueError:
+                continue
+
+            action = action.upper()
+            if action == "REPLACE":
+                if idx < len(lines):
+                    lines[idx] = text
+                else:
+                    while len(lines) < idx:
+                        lines.append("")
+                    lines.append(text)
+            elif action == "APPEND":
+                if idx + 1 <= len(lines):
+                    lines.insert(idx + 1, text)
+                else:
+                    lines.append(text)
+
+        return "\n".join(lines)
 
     def consolidate(self, thread_outputs: List[Dict[str, Any]]) -> str:
         """
@@ -72,25 +112,40 @@ class CognitiveController:
         # Combine all thread outputs
         combined_outputs = "\n\n".join(formatted_threads)
         
-        # Create the content for the user message, using "Internal Narrative" terminology
-        if self.insight_memory_block: # Check if it's non-empty
-            content = f"""
-            LATEST INNER MONOLOGUE STREAMS:
-            {combined_outputs}
+        # Create the content for the user message. When a narrative already exists it will be numbered line by line.
+        if self.insight_memory_block:
+            numbered = "\n".join(
+                f"{idx+1}. {line}" for idx, line in enumerate(self.insight_memory_block.splitlines())
+            )
+            if self.use_patch:
+                content = f"""
+                LATEST INNER MONOLOGUE STREAMS:
+                {combined_outputs}
 
-            PREVIOUS INTERNAL NARRATIVE:
-            {self.insight_memory_block}
+                PREVIOUS INTERNAL NARRATIVE (numbered sentences):
+                {numbered}
 
-            Integrate the LATEST INNER MONOLOGUE STREAMS with the PREVIOUS INTERNAL NARRATIVE to create the UPDATED INTERNAL NARRATIVE. I will reflect *my* current state, incorporating new reasoning, memories, and goals while maintaining narrative flow.
-            """
+                Provide ONLY a PATCH in JSON using the format {{line_number||ACTION}}: "sentence" where ACTION is APPEND or REPLACE.
+                Do not rewrite the entire narrative. If no update is needed, respond with an empty JSON object {{}}.
+                """
+            else:
+                content = f"""
+                LATEST INNER MONOLOGUE STREAMS:
+                {combined_outputs}
+
+                PREVIOUS INTERNAL NARRATIVE (numbered sentences):
+                {numbered}
+
+                Rewrite the entire narrative, one sentence per line, incorporating new insights.
+                """
         else:
             content = f"""
             LATEST INNER MONOLOGUE STREAMS:
             {combined_outputs}
 
-            PREVIOUS INTERNAL NARRATIVE: None (This is the first synthesis).
+            PREVIOUS INTERNAL NARRATIVE: None (first synthesis).
 
-            Synthesize the LATEST INNER MONOLOGUE STREAMS into the initial INTERNAL NARRATIVE. I should create a cohesive first-person summary reflecting *my* initial reasoning, memories, and goals based on these streams.
+            Write the initial INTERNAL NARRATIVE using one sentence per line.
             """
 
         messages = [{"role": "user", "content": content}]
@@ -124,10 +179,21 @@ class CognitiveController:
             sys.stdout.flush()
             consolidated = f"Error in controller: {str(e)}"
 
-        # Update consolidated memory block
-        self.insight_memory_block = consolidated
+        # Apply patch or store full narrative
+        if self.insight_memory_block and self.use_patch:
+            try:
+                patch = json.loads(consolidated)
+                updated = self._apply_patch(patch) if isinstance(patch, dict) else self.insight_memory_block
+            except json.JSONDecodeError:
+                print("WARNING: Failed to parse patch; keeping previous narrative")
+                updated = self.insight_memory_block
+        else:
+            # Store full narrative as provided
+            updated = "\n".join(line.strip() for line in consolidated.splitlines() if line.strip())
+
+        self.insight_memory_block = updated
         print(f"DEBUG: Consolidated understanding in cognitive controller: {self.insight_memory_block}")
         sys.stdout.flush()
- 
-        return consolidated
+
+        return self.insight_memory_block
     
