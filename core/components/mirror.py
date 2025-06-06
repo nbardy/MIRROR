@@ -14,7 +14,9 @@ class Mirror:
 
     def __init__(self, 
                  api_key: str = None,
-                 model: str = "openai/gpt-4o" # Add model parameter with default
+                 model: str = "openai/gpt-4o", # Add model parameter with default
+                 controller_patch: bool = False,
+                 monologue_patch: bool = False
                  ):
         """
         Initialize the Mirror system with all necessary components.
@@ -39,12 +41,15 @@ class Mirror:
         
         # Create OpenRouter client
         self.client = OpenRouterClient(api_key)
-        
-        # Create monologue manager, passing the model and flag
-        self.monologue_manager = MonologueManager(self.client, model=self.model)
-        
-        # Create cognitive controller, passing the model
-        self.cognitive_controller = CognitiveController(self.client, model=self.model)
+
+        # Create monologue manager, passing the model and patch flag
+        self.monologue_manager = MonologueManager(self.client, model=self.model, use_patch=monologue_patch)
+
+        # Create cognitive controller, passing the model and patch flag
+        self.cognitive_controller = CognitiveController(self.client, model=self.model, use_patch=controller_patch)
+
+        self.monologue_patch = monologue_patch
+        self.controller_patch = controller_patch
         
         # Create talker, passing the model
         self.talker = Talker(

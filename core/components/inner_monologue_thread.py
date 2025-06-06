@@ -8,7 +8,8 @@ class InnerMonologue:
     def __init__(self,
                 client: OpenRouterClient,
                 model: str = "openai/gpt-4o",
-                max_monologue_tokens: int = 10000):
+                max_monologue_tokens: int = 10000,
+                use_patch: bool = False):
         """
         Initialize the unified inner monologue processor that combines
         Reasoning, Memory, and Goal threads into a single LLM call.
@@ -20,8 +21,10 @@ class InnerMonologue:
         """
         self.client = client
         self.model = model
+        self.use_patch = use_patch
         self.monologue_history = []
         self.max_monologue_tokens = max_monologue_tokens
+        self.last_result = None
         
         print(f"INFO: Inner Monologue initialized with max monologue tokens: {self.max_monologue_tokens}")
         
@@ -45,6 +48,12 @@ class InnerMonologue:
             "goal": "They probably want... I should focus on... Maybe they're hoping for..."
         }
         """
+
+        if self.use_patch:
+            patch_instructions = (
+                "Each sentence should be on its own line. When a previous monologue is provided, respond with a PATCH for each field using keys '<line_number||ACTION>' where ACTION is APPEND or REPLACE. Return an empty object if no change is needed."
+            )
+            self.system_prompt = self.system_prompt + "\n\n" + patch_instructions
 
     def _extract_json_from_text(self, text: str) -> Dict[str, Any]:
         """
@@ -70,6 +79,34 @@ class InnerMonologue:
             'memory': "Unable to parse LLM output into required format",
             'goal': "System needs review - JSON parsing issue detected"
         }
+
+    def _apply_patch_text(self, text: str, patch: Dict[str, str]) -> str:
+        """Apply a line-based patch to a text block."""
+        lines = text.splitlines()
+        for key, value in patch.items():
+            if "||" not in key:
+                continue
+            try:
+                idx_str, action = key.split("||")
+                idx = int(idx_str) - 1
+            except ValueError:
+                continue
+
+            action = action.upper()
+            if action == "REPLACE":
+                if idx < len(lines):
+                    lines[idx] = value
+                else:
+                    while len(lines) < idx:
+                        lines.append("")
+                    lines.append(value)
+            elif action == "APPEND":
+                if idx + 1 <= len(lines):
+                    lines.insert(idx + 1, value)
+                else:
+                    lines.append(value)
+
+        return "\n".join(lines)
 
     def _estimate_tokens(self, messages: List[Dict[str, str]]) -> int:
         """
@@ -194,8 +231,24 @@ class InnerMonologue:
                 f"User: {latest_user_message_content}\n\n"
                 f"Me: {last_assistant_message_content}\n"
                 f"PRIOR CONVERSATION HISTORY WITH USER (excluding latest exchange):\n{prior_history_formatted}\n\n"
-                "PREVIOUS MONOLOGUE HISTORY: I'll refer to my previous messages in this conversation's history\n\n"
             )
+
+            if self.use_patch and self.last_result:
+                def number_lines(text: str) -> str:
+                    return "\n".join(f"{i+1}. {line}" for i, line in enumerate(text.splitlines()))
+
+                numbered_prev = {
+                    k: number_lines(self.last_result.get(k, "")) for k in ["reasoning", "memory", "goal"]
+                }
+                user_prompt_content += (
+                    "PREVIOUS MONOLOGUE (numbered):\n"
+                    f"Reasoning:\n{numbered_prev['reasoning']}\n\n"
+                    f"Memory:\n{numbered_prev['memory']}\n\n"
+                    f"Goal:\n{numbered_prev['goal']}\n\n"
+                    "Respond with a JSON PATCH for each field.\n\n"
+                )
+            else:
+                user_prompt_content += "PREVIOUS MONOLOGUE HISTORY: I'll refer to my previous messages in this conversation's history\n\n"
             # --- End Refined Prompt Construction ---
 
             # Create messages array for the chat API
@@ -261,27 +314,36 @@ class InnerMonologue:
             
             # Try to parse the response directly as JSON
             try:
-                result = json.loads(result_content)
+                parsed = json.loads(result_content)
             except json.JSONDecodeError:
-                # If direct parsing fails, try to extract JSON from text
-                result = self._extract_json_from_text(result_content)
-            
-            # Validate and ensure required keys exist
+                parsed = self._extract_json_from_text(result_content)
+
             expected_keys = ['reasoning', 'memory', 'goal']
-            for key in expected_keys:
-                if key not in result:
-                    result[key] = f"Missing {key} in response"
-            
-            # Store the combined monologue in history (only if successful)
-            if all(key in result for key in expected_keys):
-                monologue_content = json.dumps(result)
-                self.monologue_history.append({"role": "assistant", "content": monologue_content})
-                
-                # After adding new thought, check if we need to truncate the stored history
-                if self._estimate_tokens(self.monologue_history) > self.max_monologue_tokens * 0.9:
-                    self.monologue_history = self._truncate_monologue_history(self.monologue_history, 
+            result = {}
+
+            if self.use_patch and self.last_result:
+                for key in expected_keys:
+                    patch = parsed.get(key, {}) if isinstance(parsed, dict) else {}
+                    prev_text = self.last_result.get(key, "")
+                    if isinstance(patch, dict):
+                        result[key] = self._apply_patch_text(prev_text, patch)
+                    else:
+                        result[key] = str(patch)
+            else:
+                for key in expected_keys:
+                    result[key] = parsed.get(key, f"Missing {key} in response") if isinstance(parsed, dict) else f"Missing {key} in response"
+
+            # Store the combined monologue in history
+            monologue_content = json.dumps(result)
+            self.monologue_history.append({"role": "assistant", "content": monologue_content})
+
+            # After adding new thought, check if we need to truncate the stored history
+            if self._estimate_tokens(self.monologue_history) > self.max_monologue_tokens * 0.9:
+                self.monologue_history = self._truncate_monologue_history(self.monologue_history,
                                                                          int(self.max_monologue_tokens * 0.8))
-                    print(f"INFO: Truncated stored monologue history to prevent future overflow")
+                print(f"INFO: Truncated stored monologue history to prevent future overflow")
+
+            self.last_result = result
             
             processing_time = time.time() - start_time
             print(f"INFO: Inner monologue processed in {processing_time:.2f}s")
